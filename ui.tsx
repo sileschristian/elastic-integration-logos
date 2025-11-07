@@ -11,6 +11,7 @@ function App() {
   const [query, setQuery] = useState("");
   const [logosList, setLogosList] = useState<Logo[]>([]);
   const [loading, setLoading] = useState(true);
+  const [showDuplicates, setShowDuplicates] = useState(true);
 
   // Load logos from static file
   useEffect(() => {
@@ -24,10 +25,79 @@ function App() {
     }
   }, []);
 
-  const filtered = useMemo(
-    () => logosList.filter((l) => l.slug.toLowerCase().includes(query.toLowerCase())),
-    [logosList, query]
-  );
+  // Filter by query and optionally remove duplicates
+  const filtered = useMemo(() => {
+    // First, remove duplicate slugs (same integration name appearing multiple times)
+    // Keep only the first occurrence of each slug
+    const seenSlugs = new Set<string>();
+    const uniqueBySlug = logosList.filter((logo) => {
+      if (seenSlugs.has(logo.slug)) {
+        return false; // Duplicate slug, skip it
+      }
+      seenSlugs.add(logo.slug);
+      return true; // First occurrence, keep it
+    });
+    
+    // Then filter by search query
+    let result = uniqueBySlug.filter((l) => l.slug.toLowerCase().includes(query.toLowerCase()));
+    
+    // If hide duplicates is enabled, group by logo identifier (normalized filename or brand name)
+    // This uses a hybrid approach: tries to match by normalized filename first,
+    // but falls back to brand name for cases where filenames differ but logos are the same
+    if (!showDuplicates) {
+      const normalizeFilename = (filename: string): string => {
+        // Remove file extension and normalize
+        let normalized = filename.toLowerCase();
+        normalized = normalized.replace(/\.(svg|png|jpg|jpeg|gif|webp)$/i, '');
+        // Remove common prefixes
+        normalized = normalized.replace(/^(logo[-_]?|icon[-_]?|img[-_]?)/, '');
+        // Remove common suffixes
+        normalized = normalized.replace(/[-_](logo|icon|img)$/, '');
+        normalized = normalized.replace(/[-_]logo$/, '');
+        // Remove version suffixes
+        normalized = normalized.replace(/[-_]v\d*$/, '');
+        return normalized;
+      };
+      
+      const getBaseBrand = (slug: string): string => {
+        // Extract base brand name from slug (first part before underscore or hyphen)
+        const parts = slug.toLowerCase().split(/[_-]/);
+        return parts[0];
+      };
+      
+      // Use a Map to track logo identifiers and the first logo URL we saw for that identifier
+      // This allows us to use both filename and brand matching
+      const logoIdentifierMap = new Map<string, string>();
+      
+      result = result.filter((logo) => {
+        const filename = logo.logo.split('/').pop() || '';
+        const normalizedFilename = normalizeFilename(filename);
+        const baseBrand = getBaseBrand(logo.slug);
+        
+        // Determine the logo identifier to use for grouping
+        let logoIdentifier: string;
+        
+        if (normalizedFilename === 'logo' || normalizedFilename === 'icon' || normalizedFilename.length < 3) {
+          // Generic filename - use brand name for grouping (e.g., all "logo.svg" from same brand)
+          logoIdentifier = `brand:${baseBrand}`;
+        } else if (normalizedFilename.includes(baseBrand) || baseBrand.includes(normalizedFilename)) {
+          // Filename contains brand name - use brand for grouping (handles variants like mongodb, mongodb_atlas)
+          logoIdentifier = `brand:${baseBrand}`;
+        } else {
+          // Specific filename - use normalized filename for grouping
+          logoIdentifier = `file:${normalizedFilename}`;
+        }
+        
+        if (logoIdentifierMap.has(logoIdentifier)) {
+          return false; // This logo identifier was already seen, skip it
+        }
+        logoIdentifierMap.set(logoIdentifier, logo.logo);
+        return true; // First occurrence of this logo identifier, keep it
+      });
+    }
+    
+    return result;
+  }, [logosList, query, showDuplicates]);
 
   async function insertLogo(url: string) {
     const svg = await fetch(url).then((r) => r.text());
@@ -80,7 +150,6 @@ function App() {
 
   return (
     <div style={{ padding: "16px 16px 0 16px", fontFamily: "Inter, sans-serif", width: "100%", height: "100%", display: "flex", flexDirection: "column", boxSizing: "border-box" }}>
-      <h3 style={{ marginBottom: 8, marginTop: 0, padding: 0 }}>Elastic Integration Logos</h3>
       {loading && (
         <div style={{ padding: 20, textAlign: "center", color: "#666" }}>
           Loading integrations...
@@ -126,12 +195,43 @@ function App() {
         )}
       </div>
       {!loading && (
-        <div style={{ marginBottom: 12, fontSize: 12, color: "#666" }}>
-          {query ? (
-            <>Showing {filtered.length} of {logosList.length} integrations</>
-          ) : (
-            <>{logosList.length} integrations</>
-          )}
+        <div style={{ marginBottom: 12, fontSize: 12, color: "#666", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span>
+            {query ? (
+              <>Showing {filtered.length} of {logosList.length} integrations</>
+            ) : (
+              <>{filtered.length} integrations</>
+            )}
+          </span>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", userSelect: "none" }}>
+            <span style={{ fontSize: 11 }}>Show duplicates</span>
+            <div
+              onClick={() => setShowDuplicates(!showDuplicates)}
+              style={{
+                width: 36,
+                height: 20,
+                borderRadius: 10,
+                backgroundColor: showDuplicates ? "#18A0FB" : "#ccc",
+                position: "relative",
+                cursor: "pointer",
+                transition: "background-color 0.2s"
+              }}
+            >
+              <div
+                style={{
+                  width: 16,
+                  height: 16,
+                  borderRadius: "50%",
+                  backgroundColor: "white",
+                  position: "absolute",
+                  top: 2,
+                  left: showDuplicates ? 18 : 2,
+                  transition: "left 0.2s",
+                  boxShadow: "0 1px 3px rgba(0,0,0,0.3)"
+                }}
+              />
+            </div>
+          </label>
         </div>
       )}
       <div style={{ 

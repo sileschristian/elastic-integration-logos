@@ -55,10 +55,18 @@ figma.ui.onmessage = async (msg) => {
             if (hasImageFill) {
               console.log("Component/Instance has image fill, replacing it...");
               try {
+                // Store original position to prevent movement
+                const originalX = selectedNode.x;
+                const originalY = selectedNode.y;
+                
                 // For fills, we need to convert SVG to a raster image
                 const tempSvgNode = figma.createNodeFromSvg(msg.svg);
                 figma.currentPage.appendChild(tempSvgNode);
-                const imageBytes = await tempSvgNode.exportAsync({ format: "PNG" });
+                // Export at high resolution to avoid pixelation (4096px max dimension)
+                const imageBytes = await tempSvgNode.exportAsync({ 
+                  format: "PNG",
+                  constraint: { type: "SCALE", value: 4 } // 4x scale for high resolution
+                });
                 tempSvgNode.remove();
                 
                 const imageHash = figma.createImage(imageBytes).hash;
@@ -85,9 +93,13 @@ figma.ui.onmessage = async (msg) => {
                   }
                 }
                 
+                // Apply fills and restore position to prevent movement
                 selectedNode.fills = newFills;
+                selectedNode.x = originalX;
+                selectedNode.y = originalY;
+                
                 console.log("Image fill replaced successfully");
-                figma.viewport.scrollAndZoomIntoView([selectedNode]);
+                // Don't scroll - keeps viewport stable and prevents movement
                 return;
               } catch (error) {
                 console.error("Error replacing image fill in component:", error);
@@ -175,80 +187,87 @@ figma.ui.onmessage = async (msg) => {
           selectedNode.type === "LINE") {
         
         try {
-          // Check if the node supports fills
-          if (!("fills" in selectedNode)) {
-            // Fall through to default behavior
-            throw new Error("Node does not support fills");
-          }
+          console.log("Attempting to replace shape with SVG. SVG length:", msg.svg.length);
           
-          // For fills, we need to convert SVG to a raster image
-          // First, create a temporary SVG node to get the image
-          const tempSvgNode = figma.createNodeFromSvg(msg.svg);
+          // Replace the shape with the SVG node to keep it as a vector (no PNG conversion!)
+          const svgNode = figma.createNodeFromSvg(msg.svg);
+          console.log("SVG node created successfully, size:", svgNode.width, "x", svgNode.height);
           
-          // Add to page temporarily (required for export)
-          figma.currentPage.appendChild(tempSvgNode);
+          // Get the parent and position of the selected node BEFORE removing it
+          const parent = selectedNode.parent;
+          const x = selectedNode.x;
+          const y = selectedNode.y;
+          const width = selectedNode.width;
+          const height = selectedNode.height;
           
-          // Export the SVG node as PNG bytes
-          const imageBytes = await tempSvgNode.exportAsync({ format: "PNG" });
+          console.log("Original shape dimensions:", width, "x", height, "at", x, ",", y);
           
-          // Remove the temporary node
-          tempSvgNode.remove();
+          // Scale the SVG to fit the original shape's dimensions (maintaining aspect ratio)
+          const scaleX = width / svgNode.width;
+          const scaleY = height / svgNode.height;
+          const scale = Math.min(scaleX, scaleY);
           
-          // Create image from PNG bytes
-          const imageHash = figma.createImage(imageBytes).hash;
+          console.log("Calculated scale:", scale);
           
-          // Get current fills or initialize empty array
-          const currentFills = selectedNode.fills && Array.isArray(selectedNode.fills) 
-            ? selectedNode.fills 
-            : [];
+          svgNode.resize(svgNode.width * scale, svgNode.height * scale);
           
-          // Create the new image fill
-          const newImageFill: ImagePaint = {
-            type: "IMAGE",
-            imageHash: imageHash,
-            scaleMode: "FILL",
-            opacity: 1,
-            visible: true,
-            blendMode: "NORMAL"
-          };
-          
-          // If there are existing fills, replace the first one (typically the active one in inspector)
-          // If no fills exist, add the logo as the first fill
-          if (currentFills.length > 0) {
-            // Replace first fill, preserve its properties if possible
-            const firstFill = currentFills[0];
-            const newFills: Paint[] = [
-              {
-                type: "IMAGE",
-                imageHash: imageHash,
-                scaleMode: "FILL",
-                opacity: firstFill.opacity !== undefined ? firstFill.opacity : 1,
-                visible: firstFill.visible !== undefined ? firstFill.visible : true,
-                blendMode: firstFill.blendMode || "NORMAL"
-              },
-              ...currentFills.slice(1) // Keep other fills
-            ];
-            selectedNode.fills = newFills;
+          // Insert the SVG node into the parent FIRST (so coordinates are relative to parent)
+          // Check if parent can accept children (frames, components, instances, groups, pages)
+          if (parent && "appendChild" in parent && 
+              (parent.type === "FRAME" || parent.type === "COMPONENT" || 
+               parent.type === "INSTANCE" || parent.type === "GROUP" || 
+               parent.type === "PAGE")) {
+            try {
+              parent.appendChild(svgNode);
+              console.log("Appended to parent:", parent.type);
+            } catch (appendError) {
+              console.warn("Failed to append to parent, appending to page instead:", appendError);
+              figma.currentPage.appendChild(svgNode);
+            }
           } else {
-            // No fills exist, add the logo as the first fill
-            selectedNode.fills = [newImageFill];
+            figma.currentPage.appendChild(svgNode);
+            console.log("Appended to page (no valid parent)");
           }
           
-          figma.viewport.scrollAndZoomIntoView([selectedNode]);
+          // Set position AFTER appending (ensures correct coordinate system)
+          // Center the SVG within the original shape's bounds
+          svgNode.x = x + (width - svgNode.width) / 2;
+          svgNode.y = y + (height - svgNode.height) / 2;
+          
+          console.log("Positioned SVG at:", svgNode.x, ",", svgNode.y);
+          
+          // Remove the original shape AFTER positioning the new one
+          selectedNode.remove();
+          console.log("Original shape removed");
+          
+          // Select the new SVG node (but don't scroll - keeps viewport stable)
+          figma.currentPage.selection = [svgNode];
+          console.log("Shape replacement completed successfully");
           return;
         } catch (error) {
-          console.error("Error replacing fill:", error);
+          console.error("Error replacing shape with SVG:", error);
+          console.error("Error details:", error instanceof Error ? error.message : String(error));
+          console.error("SVG preview (first 200 chars):", msg.svg.substring(0, 200));
           // Fall through to default behavior
         }
       }
     }
     
-    // Default behavior: insert at the center of the viewport
+    // Default behavior: insert at a fixed, always-visible position
     const node = figma.createNodeFromSvg(msg.svg);
+    
+    // Use viewport center but offset significantly to the right to avoid plugin window
+    // Plugin is 600px wide, so offset by at least 400px to the right
     const viewportCenter = figma.viewport.center;
-    node.x = viewportCenter.x - node.width / 2;
-    node.y = viewportCenter.y - node.height / 2;
+    const offsetX = 450; // Large offset to the right (past plugin window)
+    const offsetY = -100; // Slight offset upward for better visibility
+    
+    // Place logo at a consistent position: right of center, slightly above center
+    node.x = viewportCenter.x + offsetX - node.width / 2;
+    node.y = viewportCenter.y + offsetY - node.height / 2;
+    
     figma.currentPage.appendChild(node);
+    // Scroll to ensure it's visible
     figma.viewport.scrollAndZoomIntoView([node]);
   } else if (msg.type === "prepare-drop") {
     // Store SVG for drag and drop

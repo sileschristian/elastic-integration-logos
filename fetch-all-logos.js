@@ -16,72 +16,171 @@ const path = require('path');
 // Fetch all packages from GitHub and find their logos
 async function fetchAllLogos() {
   try {
-    console.log('Fetching all packages from GitHub...');
+    console.log('Fetching all packages from GitHub using Tree API...');
     
-    // Fetch all packages using pagination
-    let allPackages = [];
-    let page = 1;
-    let hasMore = true;
+    // Use GitHub Tree API to get the entire packages directory structure in one call
+    // This is much more efficient than paginating through contents
+    const treeUrl = 'https://api.github.com/repos/elastic/integrations/git/trees/main?recursive=1';
+    console.log('Fetching repository tree (this may take a moment)...');
     
-    while (hasMore) {
-      const url = `https://api.github.com/repos/elastic/integrations/contents/packages?per_page=100&page=${page}`;
-      console.log(`Fetching page ${page}...`);
+    const treeData = await fetchJSON(treeUrl);
+    
+    if (!treeData || !treeData.tree || !Array.isArray(treeData.tree)) {
+      throw new Error('Failed to fetch repository tree');
+    }
+    
+    // Check if tree was truncated (GitHub limits tree size to ~100k entries)
+    if (treeData.truncated) {
+      console.warn('⚠️  WARNING: Repository tree was truncated. Some packages may be missing.');
+      console.warn('   Consider using the paginated Contents API approach instead.');
+    }
+    
+    console.log(`Fetched ${treeData.tree.length} files from repository`);
+    
+    // Extract all package directories and their logo files
+    // Also extract policy_templates (child cards) for packages like AWS, Azure, connectors
+    // Also extract service_type logos (e.g., elastic_connectors/img/service_type/*.svg)
+    const packageMap = new Map(); // packageName -> { allImageFiles: [] }
+    const policyTemplateMap = new Map(); // policyTemplateSlug -> { allImageFiles: [], parentPackage: packageName }
+    const serviceTypeMap = new Map(); // serviceTypeSlug -> { logo: url, parentPackage: packageName }
+    
+    for (const item of treeData.tree) {
+      const pathMatch = item.path.match(/^packages\/([^\/]+)\/(.+)$/);
+      if (!pathMatch) continue;
       
-      const packages = await fetchJSON(url);
+      const packageName = pathMatch[1];
+      const filePath = pathMatch[2];
       
-      if (!Array.isArray(packages)) {
-        if (packages.message) {
-          throw new Error(packages.message);
-        }
-        break;
+      // Only process files (not directories)
+      if (item.type !== 'blob') continue;
+      
+      // Check if it's an image file
+      if (!/\.(svg|png|jpg|jpeg|gif|webp)$/i.test(filePath)) continue;
+      
+      // Check if this is a service type logo (e.g., img/service_type/amazon_s3.svg)
+      // These should be separate entries, one per service type
+      const serviceTypeMatch = filePath.match(/^img\/service_type\/([^\/]+)\.(svg|png|jpg|jpeg|gif|webp)$/i);
+      if (serviceTypeMatch) {
+        const serviceTypeName = serviceTypeMatch[1];
+        const serviceTypeSlug = serviceTypeName; // Use filename (without extension) as slug
+        const fileExtension = serviceTypeMatch[2];
+        
+        // Build the logo URL
+        const logoUrl = buildLogoUrl(packageName, 'img/service_type', `${serviceTypeName}.${fileExtension}`, false);
+        
+        serviceTypeMap.set(`${packageName}_${serviceTypeSlug}`, {
+          slug: serviceTypeSlug,
+          logo: logoUrl,
+          parentPackage: packageName
+        });
+        continue; // Skip adding to packageMap
       }
       
-      const dirs = packages.filter(pkg => pkg.type === 'dir');
-      allPackages.push(...dirs);
-      console.log(`Found ${dirs.length} packages on page ${page} (total: ${allPackages.length})`);
+      // Check if this is a policy template (child card)
+      const policyTemplateMatch = filePath.match(/^policy_templates\/([^\/]+)\/(.+)$/);
       
-      if (packages.length < 100) {
-        hasMore = false;
+      if (policyTemplateMatch) {
+        // This is a policy template (child card)
+        const policyTemplateName = policyTemplateMatch[1];
+        const policyTemplatePath = policyTemplateMatch[2];
+        const policyTemplateSlug = policyTemplateName; // Use the policy template name as slug
+        
+        if (!policyTemplateMap.has(policyTemplateSlug)) {
+          policyTemplateMap.set(policyTemplateSlug, { 
+            allImageFiles: [],
+            parentPackage: packageName
+          });
+        }
+        
+        const policyTemplate = policyTemplateMap.get(policyTemplateSlug);
+        const fileName = policyTemplatePath.split('/').pop();
+        const directory = policyTemplatePath.includes('/') 
+          ? policyTemplatePath.substring(0, policyTemplatePath.lastIndexOf('/'))
+          : '';
+        
+        policyTemplate.allImageFiles.push({
+          name: fileName,
+          path: `policy_templates/${policyTemplateName}/${policyTemplatePath}`,
+          directory: directory
+        });
       } else {
-        page++;
-        // Small delay to avoid rate limiting
-        await new Promise(resolve => setTimeout(resolve, 200));
+        // This is a regular package file
+        if (!packageMap.has(packageName)) {
+          packageMap.set(packageName, { allImageFiles: [] });
+        }
+        
+        const pkg = packageMap.get(packageName);
+        const fileName = filePath.split('/').pop();
+        const directory = filePath.includes('/') ? filePath.substring(0, filePath.lastIndexOf('/')) : '';
+        
+        pkg.allImageFiles.push({ 
+          name: fileName, 
+          path: filePath,
+          directory: directory
+        });
       }
     }
     
-    console.log(`\nTotal packages found: ${allPackages.length}`);
-    console.log('Finding logos for each package...\n');
+    const allPackages = Array.from(packageMap.keys());
+    const allPolicyTemplates = Array.from(policyTemplateMap.keys());
+    const allServiceTypes = Array.from(serviceTypeMap.values());
+    console.log(`\nFound ${allPackages.length} packages, ${allPolicyTemplates.length} policy templates, and ${allServiceTypes.length} service type logos`);
+    console.log('Finding logos for each package, policy template, and service type...\n');
     
-    // Find logos for each package
+    // Find logos for each package using the tree data
     const logos = [];
-    const batchSize = 10;
+    let foundCount = 0;
     
-    for (let i = 0; i < allPackages.length; i += batchSize) {
-      const batch = allPackages.slice(i, i + batchSize);
-      const batchNum = Math.floor(i / batchSize) + 1;
-      const totalBatches = Math.ceil(allPackages.length / batchSize);
+    // Process regular packages
+    for (let i = 0; i < allPackages.length; i++) {
+      const packageName = allPackages[i];
+      const pkg = packageMap.get(packageName);
       
-      console.log(`Processing batch ${batchNum}/${totalBatches} (${i + 1}-${Math.min(i + batchSize, allPackages.length)})`);
-      
-      const batchPromises = batch.map(pkg => findLogoForPackage(pkg.name));
-      const batchResults = await Promise.all(batchPromises);
-      
-      for (const logo of batchResults) {
-        if (logo) {
-          logos.push(logo);
-        }
+      if ((i + 1) % 50 === 0 || i === allPackages.length - 1) {
+        console.log(`Processing packages ${i + 1}/${allPackages.length}... (found ${foundCount} logos so far)`);
       }
       
-      // Delay between batches
-      if (i + batchSize < allPackages.length) {
-        await new Promise(resolve => setTimeout(resolve, 500));
+      const logo = findLogoFromTreeData(packageName, pkg);
+      if (logo) {
+        logos.push(logo);
+        foundCount++;
       }
+    }
+    
+    // Process policy templates (child cards)
+    for (let i = 0; i < allPolicyTemplates.length; i++) {
+      const policyTemplateSlug = allPolicyTemplates[i];
+      const policyTemplate = policyTemplateMap.get(policyTemplateSlug);
+      const parentPackage = policyTemplate.parentPackage;
+      
+      if ((i + 1) % 50 === 0 || i === allPolicyTemplates.length - 1) {
+        console.log(`Processing policy templates ${i + 1}/${allPolicyTemplates.length}... (found ${foundCount} logos so far)`);
+      }
+      
+      const logo = findLogoFromTreeData(policyTemplateSlug, policyTemplate, parentPackage);
+      if (logo) {
+        logos.push(logo);
+        foundCount++;
+      }
+    }
+    
+    // Process service type logos (e.g., elastic_connectors service types)
+    for (let i = 0; i < allServiceTypes.length; i++) {
+      const serviceType = allServiceTypes[i];
+      logos.push({
+        slug: serviceType.slug,
+        logo: serviceType.logo
+      });
+      foundCount++;
     }
     
     // Sort by slug
     logos.sort((a, b) => a.slug.localeCompare(b.slug));
     
-    console.log(`\nFound ${logos.length} logos out of ${allPackages.length} packages`);
+    console.log(`\nFound ${logos.length} logos:`);
+    console.log(`  - ${allPackages.length} package logos`);
+    console.log(`  - ${allPolicyTemplates.length} policy template logos (child cards)`);
+    console.log(`  - ${allServiceTypes.length} service type logos`);
     
     // Generate the logos.ts file
     const fileContent = `// This file is auto-generated by fetch-all-logos.js
@@ -107,68 +206,123 @@ export const logos = [\n${logos.map(logo =>
   }
 }
 
-async function findLogoForPackage(packageName) {
-  try {
-    // Try to fetch the img folder contents
-    const imgUrl = `https://api.github.com/repos/elastic/integrations/contents/packages/${encodeURIComponent(packageName)}/img`;
-    const imgFiles = await fetchJSON(imgUrl);
-    
-    if (!Array.isArray(imgFiles)) {
-      return await tryAlternativeLogoLocations(packageName);
+// Helper function to build properly encoded GitHub raw URL
+function buildLogoUrl(packageName, directory, fileName, isPolicyTemplate = false) {
+  const baseUrl = 'https://raw.githubusercontent.com/elastic/integrations/main/packages';
+  const encodedPackage = encodeURIComponent(packageName);
+  const encodedFile = encodeURIComponent(fileName);
+  
+  if (isPolicyTemplate) {
+    // For policy templates, the directory already includes "policy_templates/..."
+    // We need to encode each path segment separately, not the whole path
+    if (directory) {
+      const pathSegments = directory.split('/');
+      const encodedSegments = pathSegments.map(seg => encodeURIComponent(seg));
+      const encodedPath = encodedSegments.join('/');
+      return `${baseUrl}/${encodedPackage}/${encodedPath}/${encodedFile}`;
+    } else {
+      return `${baseUrl}/${encodedPackage}/${encodedFile}`;
     }
-    
-    // Look for common logo file patterns (prioritized)
-    const logoPatterns = [
-      /^.*logo.*\.svg$/i,
-      /^.*-logo.*\.svg$/i,
-      /^logo.*\.svg$/i,
-      /^icon.*\.svg$/i,
-      /^.*\.svg$/i,
-      /^.*logo.*\.png$/i,
-      /^.*logo.*\.jpg$/i,
-      /^.*logo.*\.jpeg$/i,
-      /^icon.*\.png$/i,
-    ];
-    
-    for (const pattern of logoPatterns) {
-      const logoFile = imgFiles.find(file => 
-        file.type === 'file' && pattern.test(file.name)
-      );
-      
-      if (logoFile) {
-        return {
-          slug: packageName,
-          logo: `https://raw.githubusercontent.com/elastic/integrations/main/packages/${encodeURIComponent(packageName)}/img/${encodeURIComponent(logoFile.name)}`
-        };
-      }
-    }
-    
-    return await tryAlternativeLogoLocations(packageName);
-  } catch (err) {
-    return await tryAlternativeLogoLocations(packageName);
+  } else if (directory) {
+    // For regular directories (including service_type), encode each segment separately
+    // This ensures slashes remain as slashes in the URL
+    const pathSegments = directory.split('/');
+    const encodedSegments = pathSegments.map(seg => encodeURIComponent(seg));
+    const encodedPath = encodedSegments.join('/');
+    return `${baseUrl}/${encodedPackage}/${encodedPath}/${encodedFile}`;
+  } else {
+    return `${baseUrl}/${encodedPackage}/${encodedFile}`;
   }
 }
 
-async function tryAlternativeLogoLocations(packageName) {
-  try {
-    const rootUrl = `https://api.github.com/repos/elastic/integrations/contents/packages/${encodeURIComponent(packageName)}`;
-    const rootFiles = await fetchJSON(rootUrl);
+function findLogoFromTreeData(slug, pkg, parentPackage = null) {
+  if (!pkg.allImageFiles || pkg.allImageFiles.length === 0) {
+    return null;
+  }
+  
+  const isPolicyTemplate = parentPackage !== null;
+  
+  // Prioritize directories: img > assets > images > logo > root
+  const preferredDirs = ['img', 'assets', 'images', 'logo', 'logos'];
+  
+  // Group files by directory
+  const filesByDir = new Map();
+  for (const file of pkg.allImageFiles) {
+    const dir = file.directory || 'root';
+    if (!filesByDir.has(dir)) {
+      filesByDir.set(dir, []);
+    }
+    filesByDir.get(dir).push(file);
+  }
+  
+  // Look for common logo file patterns (prioritized)
+  const logoPatterns = [
+    /^.*logo.*\.svg$/i,           // Any SVG with "logo" in name
+    /^.*-logo.*\.svg$/i,          // SVG with "-logo-" in name
+    /^logo.*\.svg$/i,             // SVG starting with "logo"
+    /^icon.*\.svg$/i,             // SVG starting with "icon"
+    /^.*\.svg$/i,                 // Any SVG file
+    /^.*logo.*\.(png|jpg|jpeg)$/i, // Any PNG/JPG with "logo"
+    /^icon.*\.(png|jpg|jpeg)$/i,  // PNG/JPG starting with "icon"
+    /^.*\.(png|jpg|jpeg)$/i,      // Any PNG/JPG
+  ];
+  
+  // Search in preferred directory order
+  for (const preferredDir of preferredDirs) {
+    const files = filesByDir.get(preferredDir);
+    if (!files || files.length === 0) continue;
     
-    if (Array.isArray(rootFiles)) {
-      const logoFile = rootFiles.find(file => 
-        file.type === 'file' && /\.(svg|png|jpg|jpeg)$/i.test(file.name) &&
-        (/logo/i.test(file.name) || /icon/i.test(file.name))
-      );
-      
+    for (const pattern of logoPatterns) {
+      const logoFile = files.find(file => pattern.test(file.name));
       if (logoFile) {
+        const packageName = isPolicyTemplate ? parentPackage : slug;
         return {
-          slug: packageName,
-          logo: `https://raw.githubusercontent.com/elastic/integrations/main/packages/${encodeURIComponent(packageName)}/${encodeURIComponent(logoFile.name)}`
+          slug: slug,
+          logo: buildLogoUrl(packageName, logoFile.directory, logoFile.name, isPolicyTemplate)
         };
       }
     }
-  } catch (err) {
-    // Ignore errors
+  }
+  
+  // If nothing found in preferred dirs, search root files
+  const rootFiles = filesByDir.get('root');
+  if (rootFiles && rootFiles.length > 0) {
+    for (const pattern of logoPatterns) {
+      const logoFile = rootFiles.find(file => pattern.test(file.name));
+      if (logoFile) {
+        const packageName = isPolicyTemplate ? parentPackage : slug;
+        return {
+          slug: slug,
+          logo: buildLogoUrl(packageName, logoFile.directory || null, logoFile.name, isPolicyTemplate)
+        };
+      }
+    }
+  }
+  
+  // Last resort: search all directories (any image file)
+  for (const [dir, files] of filesByDir.entries()) {
+    // Skip if we already checked this directory
+    if (preferredDirs.includes(dir) || dir === 'root') continue;
+    
+    // Prefer SVG files
+    const svgFile = files.find(file => /\.svg$/i.test(file.name));
+    if (svgFile) {
+      const packageName = isPolicyTemplate ? parentPackage : slug;
+      return {
+        slug: slug,
+        logo: buildLogoUrl(packageName, svgFile.directory, svgFile.name, isPolicyTemplate)
+      };
+    }
+  }
+  
+  // Final fallback: any image file from any directory
+  const anyFile = pkg.allImageFiles[0];
+  if (anyFile) {
+    const packageName = isPolicyTemplate ? parentPackage : slug;
+    return {
+      slug: slug,
+      logo: buildLogoUrl(packageName, anyFile.directory, anyFile.name, isPolicyTemplate)
+    };
   }
   
   return null;

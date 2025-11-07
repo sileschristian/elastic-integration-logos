@@ -4,13 +4,14 @@
   "description": "Figma plugin that lets you search and insert Elastic integration logos.",
   "main": "code.js",
   "scripts": {
-    "build": "esbuild ui.tsx --bundle --outfile=dist/ui.js --loader:.ts=ts --loader:.tsx=tsx --format=iife --platform=browser --minify && node build-code.js && cp ui.html dist/",
+    "build": "esbuild ui.tsx --bundle --outfile=dist/ui.js --loader:.ts=ts --loader:.tsx=tsx --format=iife --platform=browser --minify && node build-code.js && node build-manifest.js && cp ui.html dist/",
     "dev": "esbuild ui.tsx --bundle --outfile=dist/ui.js --loader:.ts=ts --loader:.tsx=tsx --watch",
     "lint": "eslint --ext .ts,.tsx --ignore-pattern node_modules .",
     "lint:fix": "eslint --ext .ts,.tsx --ignore-pattern node_modules --fix .",
     "watch": "npm run dev",
-    "fetch-logos": "node fetch-all-logos.js"
-  },  
+    "fetch-logos": "node fetch-all-logos.js",
+    "generate-icon": "node generate-icon.js"
+  },
   "author": "",
   "license": "",
   "dependencies": {
@@ -26,6 +27,8 @@
     "@typescript-eslint/parser": "^6.12.0",
     "esbuild": "^0.19.12",
     "eslint": "^8.54.0",
+    "sharp": "^0.34.5",
+    "svg2png-wasm": "^1.4.1",
     "typescript": "^5.3.2"
   },
   "eslintConfig": {
